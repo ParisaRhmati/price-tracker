@@ -11,9 +11,12 @@ The header row is located by finding the row that contains a cell equal to
 so inserting a new column (like BRAND) or shifting rows doesn't break import.
 
 The importer is idempotent: re-importing updates URLs in place and does not
-create duplicate ProductSource rows. Brands are auto-created by name; the
-first two (Samsung, Xiaomi) are seeded with fixed ids by the migration, and
-any new brand gets the next available id.
+create duplicate ProductSource rows.
+
+SYNC MODE (sync=True): after importing, any Product whose model_name is NOT in
+the spreadsheet is DELETED, so the database becomes an exact mirror of the
+Excel. Use this when the Excel is the single source of truth. Without it, the
+importer only adds/updates and never removes (the safe default).
 """
 from __future__ import annotations
 
@@ -40,8 +43,10 @@ BRAND_LABEL = "brand"
 class ImportReport:
     products_created: int = 0
     products_updated: int = 0
+    products_deleted: int = 0
     sources_created: int = 0
     sources_updated: int = 0
+    sources_deleted: int = 0
     brands_created: int = 0
     skipped_rows: int = 0
     website_columns: list[str] = field(default_factory=list)
@@ -51,8 +56,10 @@ class ImportReport:
         return {
             "products_created": self.products_created,
             "products_updated": self.products_updated,
+            "products_deleted": self.products_deleted,
             "sources_created": self.sources_created,
             "sources_updated": self.sources_updated,
+            "sources_deleted": self.sources_deleted,
             "brands_created": self.brands_created,
             "skipped_rows": self.skipped_rows,
             "website_columns": self.website_columns,
@@ -104,8 +111,12 @@ def _normalize_url(value) -> str:
 
 
 @transaction.atomic
-def import_excel(file_obj: str | Path | IO[bytes]) -> ImportReport:
-    """Parse the spreadsheet and upsert Brand + Product + ProductSource rows."""
+def import_excel(file_obj: str | Path | IO[bytes], sync: bool = False) -> ImportReport:
+    """Parse the spreadsheet and upsert Brand + Product + ProductSource rows.
+
+    If sync=True, products not present in the spreadsheet are deleted so the
+    database exactly mirrors the Excel.
+    """
     report = ImportReport()
 
     workbook = load_workbook(file_obj, data_only=True, read_only=True)
@@ -125,6 +136,9 @@ def import_excel(file_obj: str | Path | IO[bytes]) -> ImportReport:
 
     header_index, model_col, brand_col, website_columns = resolved
     report.website_columns = list(website_columns.values())
+
+    # Track every model name we see in the Excel (for sync-mode deletion).
+    seen_model_names: set[str] = set()
 
     # Cache brands we touch this run so we only hit the DB once per name.
     brand_cache: dict[str, Brand] = {}
@@ -157,6 +171,7 @@ def import_excel(file_obj: str | Path | IO[bytes]) -> ImportReport:
             continue
 
         model_name = str(model_cell).strip()
+        seen_model_names.add(model_name)
 
         # Resolve the brand for this row (if a BRAND column exists and has a
         # value). Auto-creates unknown brands with the next id.
@@ -179,12 +194,18 @@ def import_excel(file_obj: str | Path | IO[bytes]) -> ImportReport:
             product.brand = brand
             product.save(update_fields=["brand", "updated_at"])
 
+        # Track which website columns this product actually has a URL for, so
+        # in sync mode we can drop sources that were removed from the Excel.
+        seen_websites_for_product: set[str] = set()
+
         for col_index, website_name in website_columns.items():
             if col_index >= len(row):
                 continue
             url = _normalize_url(row[col_index])
             if not url:
                 continue
+
+            seen_websites_for_product.add(website_name)
 
             existing = ProductSource.objects.filter(
                 product=product, website_name=website_name
@@ -217,10 +238,39 @@ def import_excel(file_obj: str | Path | IO[bytes]) -> ImportReport:
             deleted_count = stale.count()
             if deleted_count:
                 stale.delete()
+                report.sources_deleted += deleted_count
                 report.warnings.append(
                     f"Removed {deleted_count} stale URL(s) for "
                     f"{model_name} @ {website_name}"
                 )
+
+        # In sync mode, remove sources for this product whose website column
+        # was blanked out in the Excel (URL deleted from the sheet).
+        if sync:
+            orphan_sources = ProductSource.objects.filter(product=product).exclude(
+                website_name__in=seen_websites_for_product
+            )
+            orphan_count = orphan_sources.count()
+            if orphan_count:
+                orphan_sources.delete()
+                report.sources_deleted += orphan_count
+                report.warnings.append(
+                    f"Removed {orphan_count} source(s) no longer in Excel for {model_name}"
+                )
+
+    # SYNC: delete products that are no longer present in the spreadsheet, so
+    # the database mirrors the Excel exactly.
+    if sync:
+        to_delete = Product.objects.exclude(model_name__in=seen_model_names)
+        names = list(to_delete.values_list("model_name", flat=True))
+        count = to_delete.count()
+        if count:
+            to_delete.delete()
+            report.products_deleted += count
+            preview = ", ".join(names[:10]) + ("..." if len(names) > 10 else "")
+            report.warnings.append(
+                f"Sync: removed {count} product(s) not in Excel: {preview}"
+            )
 
     logger.info("Excel import done: %s", report.as_dict())
     return report
